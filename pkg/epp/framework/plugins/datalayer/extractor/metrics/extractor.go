@@ -302,6 +302,9 @@ func populateCacheInfoMetrics(clone *fwkdl.Metrics, metric *dto.Metric, blockSiz
 			}
 		}
 	}
+	if clone.CacheBlockSize > 0 && clone.CacheNumBlocks > 0 {
+		clone.KvCacheMaxTokenCapacity = clone.CacheBlockSize * clone.CacheNumBlocks
+	}
 }
 
 // addAdapters splits a comma-separated adapter list and stores keys with default value 0.
