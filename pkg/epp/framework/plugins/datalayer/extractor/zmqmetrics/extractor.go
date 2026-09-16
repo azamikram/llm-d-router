@@ -19,45 +19,71 @@ package zmqmetrics
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"strconv"
-	"time"
 
-	"github.com/vmihailenco/msgpack/v5"
-	"sigs.k8s.io/controller-runtime/pkg/log"
-
-	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
-	sourcezmq "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/source/zmqmetrics"
 )
 
 const ZMQExtractorType = "zmq-state-extractor"
 
-// Extractor implements ZMQ msgpack metrics extraction.
+// Supported engine names for the extractor's payload decoder.
+const (
+	EngineSGLang = "sglang"
+)
+
+// extractFunc decodes an engine-specific payload and updates endpoint metrics.
+type extractFunc func(ctx context.Context, in fwkdl.StreamInput[[]byte]) error
+
+// engineExtractors maps an engine name to its payload decoder.
+var engineExtractors = map[string]extractFunc{
+	EngineSGLang: extractSGLang,
+}
+
+// zmqExtractorParams holds the configuration parameters for the ZMQ extractor plugin.
+type zmqExtractorParams struct {
+	// Engine selects the payload decoder. Required. Supported values: "sglang".
+	Engine string `json:"engine"`
+}
+
+// Extractor implements ZMQ metrics extraction with an engine-specific payload decoder.
 type Extractor struct {
 	typedName fwkplugin.TypedName
+	extract   extractFunc
 }
 
 var _ fwkdl.StreamingExtractor[[]byte] = (*Extractor)(nil)
 
-// NewZMQMetricsExtractor returns a new ZMQ metrics extractor.
-func NewZMQMetricsExtractor(name string) *Extractor {
+// NewZMQMetricsExtractor returns a new ZMQ metrics extractor for the given engine.
+func NewZMQMetricsExtractor(name, engine string) (*Extractor, error) {
 	if name == "" {
 		name = ZMQExtractorType
+	}
+	if engine == "" {
+		return nil, fmt.Errorf("engine parameter is required for %s", ZMQExtractorType)
+	}
+	extract, ok := engineExtractors[engine]
+	if !ok {
+		return nil, fmt.Errorf("unsupported engine %q for %s", engine, ZMQExtractorType)
 	}
 	return &Extractor{
 		typedName: fwkplugin.TypedName{
 			Type: ZMQExtractorType,
 			Name: name,
 		},
-	}
+		extract: extract,
+	}, nil
 }
 
 // ZMQExtractorFactory is a factory function used to instantiate ZMQ extractor plugins.
-func ZMQExtractorFactory(name string, _ *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
-	return NewZMQMetricsExtractor(name), nil
+func ZMQExtractorFactory(name string, parameters *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
+	cfg := &zmqExtractorParams{}
+	if parameters != nil {
+		if err := parameters.Decode(cfg); err != nil {
+			return nil, err
+		}
+	}
+	return NewZMQMetricsExtractor(name, cfg.Engine)
 }
 
 // TypedName returns the type and name of the Extractor.
@@ -65,180 +91,7 @@ func (ext *Extractor) TypedName() fwkplugin.TypedName {
 	return ext.typedName
 }
 
-// Extract decodes the msgpack payload and updates endpoint metrics.
+// Extract decodes the payload with the configured engine decoder and updates endpoint metrics.
 func (ext *Extractor) Extract(ctx context.Context, in fwkdl.StreamInput[[]byte]) error {
-	payload := in.Payload
-	var stats sourcezmq.ZmqMetricsStats
-
-	if err := decodeMsgpackPayload(payload, &stats); err != nil {
-		return fmt.Errorf("failed to unmarshal msgpack (len=%d, hex=%x): %w", len(payload), truncateBytes(payload, 32), err)
-	}
-
-	ep := in.Endpoint
-	current := ep.GetMetrics()
-	clone := current.Clone()
-
-	clone.RunningRequestsSize = stats.NumRequestsRunning
-	clone.WaitingQueueSize = stats.NumRequestsWaiting
-	clone.KVCacheUsagePercent = stats.KVCacheUsagePerc
-
-	if stats.CacheConfigInfo != nil {
-		if val, ok := parseToInt(stats.CacheConfigInfo["block_size"]); ok {
-			clone.CacheBlockSize = val
-		}
-		if val, ok := parseToInt(stats.CacheConfigInfo["num_gpu_blocks"]); ok {
-			clone.CacheNumBlocks = val
-		}
-		if val, ok := parseToInt(stats.CacheConfigInfo["kv_cache_size_tokens"]); ok {
-			clone.KvCacheMaxTokenCapacity = val
-		} else if clone.CacheBlockSize > 0 && clone.CacheNumBlocks > 0 {
-			clone.KvCacheMaxTokenCapacity = clone.CacheBlockSize * clone.CacheNumBlocks
-		}
-	}
-
-	clone.UpdateTime = time.Now()
-
-	logger := log.FromContext(ctx).WithValues("endpoint", ep.GetMetadata().NamespacedName)
-	logger.V(logutil.DEBUG).Info("Refreshed metrics via ZMQ", "updated", clone)
-
-	ep.UpdateMetrics(clone)
-	return nil
-}
-
-func decodeMsgpackPayload(payload []byte, target *sourcezmq.ZmqMetricsStats) error {
-	if len(payload) == 0 {
-		return errors.New("empty payload")
-	}
-
-	// 1. Try direct struct unmarshal
-	if err := msgpack.Unmarshal(payload, target); err == nil {
-		return nil
-	}
-
-	// 2. Try generic map[string]any
-	var rawMap map[string]any
-	if err := msgpack.Unmarshal(payload, &rawMap); err == nil {
-		populateStatsFromMap(rawMap, target)
-		return nil
-	}
-
-	// 3. Try slice/tuple unmarshal ([]any)
-	var rawSlice []any
-	if err := msgpack.Unmarshal(payload, &rawSlice); err == nil {
-		populateStatsFromSlice(rawSlice, target)
-		return nil
-	}
-
-	return errors.New("invalid msgpack format")
-}
-
-func populateStatsFromMap(m map[string]any, target *sourcezmq.ZmqMetricsStats) {
-	if val, ok := parseToInt(m["num_requests_running"]); ok {
-		target.NumRequestsRunning = val
-	}
-	if val, ok := parseToInt(m["num_requests_waiting"]); ok {
-		target.NumRequestsWaiting = val
-	}
-	if val, ok := parseToFloat(m["kv_cache_usage_perc"]); ok {
-		target.KVCacheUsagePerc = val
-	}
-	if cfgMap, ok := m["cache_config_info"].(map[string]any); ok {
-		target.CacheConfigInfo = cfgMap
-	}
-	if engineID, ok := m["engine_id"].(string); ok {
-		target.EngineID = engineID
-	}
-}
-
-func populateStatsFromSlice(s []any, target *sourcezmq.ZmqMetricsStats) {
-	if len(s) > 0 {
-		if val, ok := parseToInt(s[0]); ok {
-			target.NumRequestsRunning = val
-		}
-	}
-	if len(s) > 1 {
-		if val, ok := parseToInt(s[1]); ok {
-			target.NumRequestsWaiting = val
-		}
-	}
-	if len(s) > 2 {
-		if val, ok := parseToFloat(s[2]); ok {
-			target.KVCacheUsagePerc = val
-		}
-	}
-	if len(s) > 3 {
-		if cfgMap, ok := s[3].(map[string]any); ok {
-			target.CacheConfigInfo = cfgMap
-		}
-	}
-	if len(s) > 4 {
-		if engineID, ok := s[4].(string); ok {
-			target.EngineID = engineID
-		}
-	}
-}
-
-func truncateBytes(b []byte, n int) []byte {
-	if len(b) > n {
-		return b[:n]
-	}
-	return b
-}
-
-func parseToFloat(val any) (float64, bool) {
-	if val == nil {
-		return 0, false
-	}
-	switch v := val.(type) {
-	case float64:
-		return v, true
-	case float32:
-		return float64(v), true
-	case int:
-		return float64(v), true
-	case int64:
-		return float64(v), true
-	case string:
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			return f, true
-		}
-	}
-	return 0, false
-}
-
-func parseToInt(val any) (int, bool) {
-	if val == nil {
-		return 0, false
-	}
-	switch v := val.(type) {
-	case int:
-		return v, true
-	case int8:
-		return int(v), true
-	case int16:
-		return int(v), true
-	case int32:
-		return int(v), true
-	case int64:
-		return int(v), true
-	case uint:
-		return int(v), true
-	case uint8:
-		return int(v), true
-	case uint16:
-		return int(v), true
-	case uint32:
-		return int(v), true
-	case uint64:
-		return int(v), true
-	case float32:
-		return int(v), true
-	case float64:
-		return int(v), true
-	case string:
-		if i, err := strconv.Atoi(v); err == nil {
-			return i, true
-		}
-	}
-	return 0, false
+	return ext.extract(ctx, in)
 }
