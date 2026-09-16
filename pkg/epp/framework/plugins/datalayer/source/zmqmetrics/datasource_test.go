@@ -67,6 +67,25 @@ func TestZMQDataSourceFactory(t *testing.T) {
 		require.True(t, ok)
 		assert.Equal(t, "9999", ds.port)
 	})
+
+	t.Run("invalid port", func(t *testing.T) {
+		for _, port := range []string{"abc", "0", "-1", "65536", "55 56"} {
+			params := []byte(`{"port": "` + port + `"}`)
+			dec := json.NewDecoder(bytes.NewReader(params))
+			_, err := ZMQDataSourceFactory("zmq-test", dec, nil)
+			assert.Error(t, err, "port %q should be rejected", port)
+		}
+	})
+}
+
+func TestZMQDataSource_StartEmptyAddress(t *testing.T) {
+	src, err := NewZMQDataSource("", "test-zmq")
+	require.NoError(t, err)
+
+	ep := fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{}, nil)
+	err = src.Start(context.Background(), ep)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no address")
 }
 
 func TestZMQDataSource_Start(t *testing.T) {

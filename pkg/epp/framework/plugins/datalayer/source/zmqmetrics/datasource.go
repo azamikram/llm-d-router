@@ -25,6 +25,7 @@ import (
 	"reflect"
 	"runtime/debug"
 	"slices"
+	"strconv"
 	"sync"
 	"time"
 
@@ -70,6 +71,9 @@ func NewZMQDataSource(port, name string) (*ZMQDataSource, error) {
 	if port == "" {
 		port = defaultZMQPort
 	}
+	if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
+		return nil, fmt.Errorf("invalid port %q for %s", port, ZMQDataSourceType)
+	}
 	return &ZMQDataSource{
 		typedName: fwkplugin.TypedName{Type: ZMQDataSourceType, Name: name},
 		port:      port,
@@ -96,7 +100,7 @@ func (s *ZMQDataSource) TypedName() fwkplugin.TypedName {
 func (s *ZMQDataSource) Start(ctx context.Context, ep fwkdl.Endpoint) error {
 	ip := ep.GetMetadata().GetIPAddress()
 	if ip == "" {
-		ip = ep.GetMetadata().Address
+		return fmt.Errorf("endpoint %s has no address", ep.GetMetadata().GetNamespacedName())
 	}
 	address := "tcp://" + net.JoinHostPort(ip, s.port)
 	logger := log.FromContext(ctx).WithValues("endpoint", ip)
