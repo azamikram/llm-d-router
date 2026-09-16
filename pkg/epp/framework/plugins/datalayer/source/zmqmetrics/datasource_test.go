@@ -68,6 +68,16 @@ func TestZMQDataSourceFactory(t *testing.T) {
 		assert.Equal(t, "9999", ds.port)
 	})
 
+	t.Run("unquoted numeric port", func(t *testing.T) {
+		params := []byte(`{"port": 5557}`)
+		dec := json.NewDecoder(bytes.NewReader(params))
+		p, err := ZMQDataSourceFactory("zmq-test", dec, nil)
+		require.NoError(t, err)
+		ds, ok := p.(*ZMQDataSource)
+		require.True(t, ok)
+		assert.Equal(t, "5557", ds.port)
+	})
+
 	t.Run("invalid port", func(t *testing.T) {
 		for _, port := range []string{"abc", "0", "-1", "65536", "55 56"} {
 			params := []byte(`{"port": "` + port + `"}`)

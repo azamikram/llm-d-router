@@ -45,7 +45,8 @@ const defaultZMQPort = "5556"
 var ErrExtractorTypeMismatch = errors.New("extractor type mismatch")
 
 type zmqDatasourceParams struct {
-	Port string `json:"port"`
+	// Port accepts both YAML spellings: port: 5557 and port: "5557".
+	Port json.Number `json:"port"`
 }
 
 // ZMQDataSource is a typed streaming dispatcher that connects to a model server's
@@ -88,7 +89,7 @@ func ZMQDataSourceFactory(name string, parameters *json.Decoder, _ fwkplugin.Han
 			return nil, err
 		}
 	}
-	return NewZMQDataSource(cfg.Port, name)
+	return NewZMQDataSource(cfg.Port.String(), name)
 }
 
 func (s *ZMQDataSource) TypedName() fwkplugin.TypedName {
